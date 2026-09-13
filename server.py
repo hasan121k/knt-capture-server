@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-KNT Capture Server -- captures UID + cross-checks with subordinate list
+KNT Capture Server -- captures + subordinates + UID check
 """
 
 import os
@@ -55,6 +55,13 @@ def init_db():
         captured_at  TEXT DEFAULT CURRENT_TIMESTAMP
     );
     CREATE INDEX IF NOT EXISTS idx_sub_uid ON subordinates(uid);
+
+    CREATE TABLE IF NOT EXISTS bot_users (
+        telegram_id  INTEGER PRIMARY KEY,
+        uid          TEXT,
+        first_seen   TEXT DEFAULT CURRENT_TIMESTAMP,
+        last_check   TEXT
+    );
     """)
     conn.commit()
     conn.close()
@@ -115,19 +122,17 @@ def save_subordinate(owner_uid, sub):
 
 
 def get_cross_report():
-    """Compare captured UIDs vs subordinate list."""
     conn = sqlite3.connect(DB)
     conn.row_factory = sqlite3.Row
-    cap_uids = {r["uid"] for r in conn.execute("SELECT DISTINCT uid FROM captures").fetchall() if r["uid"]}
-    sub_uids = {r["uid"] for r in conn.execute("SELECT uid FROM subordinates").fetchall() if r["uid"]}
+    cap_uids = {r["uid"] for r in conn.execute(
+        "SELECT DISTINCT uid FROM captures").fetchall() if r["uid"]}
+    sub_uids = {r["uid"] for r in conn.execute(
+        "SELECT uid FROM subordinates").fetchall() if r["uid"]}
     conn.close()
-    confirmed = sorted(cap_uids & sub_uids)
-    unknown = sorted(cap_uids - sub_uids)
-    only_sub = sorted(sub_uids - cap_uids)
     return {
-        "confirmed": confirmed,
-        "unknown": unknown,
-        "only_subordinate": only_sub,
+        "confirmed": sorted(cap_uids & sub_uids),
+        "unknown": sorted(cap_uids - sub_uids),
+        "only_subordinate": sorted(sub_uids - cap_uids),
     }
 
 
@@ -160,8 +165,14 @@ async def handle_health(req):
     conn = sqlite3.connect(DB)
     n_cap = conn.execute("SELECT COUNT(*) FROM captures").fetchone()[0]
     n_sub = conn.execute("SELECT COUNT(*) FROM subordinates").fetchone()[0]
+    n_bot = conn.execute("SELECT COUNT(*) FROM bot_users").fetchone()[0]
     conn.close()
-    return web.json_response({"ok": True, "captures": n_cap, "subordinates": n_sub})
+    return web.json_response({
+        "ok": True,
+        "captures": n_cap,
+        "subordinates": n_sub,
+        "bot_users": n_bot,
+    })
 
 
 async def handle_ingest(req):
@@ -198,7 +209,6 @@ async def handle_ingest(req):
 
 
 async def handle_subs_ingest(req):
-    """receive subordinate list from admin phone"""
     if req.headers.get("X-Ingest-Token", "") != INGEST_TOKEN:
         return web.json_response({"ok": False, "err": "unauthorized"}, status=401)
     try:
@@ -219,7 +229,6 @@ async def handle_subs_ingest(req):
         if save_subordinate(owner, it):
             saved += 1
 
-    # cross-check report
     rep = get_cross_report()
     asyncio.create_task(notify(
         f"📡 <b>Subordinate Sync</b>\n\n"
@@ -227,7 +236,7 @@ async def handle_subs_ingest(req):
         f"📥 received: {len(items)}\n"
         f"✔ saved: {saved}\n\n"
         f"✅ confirmed: <b>{len(rep['confirmed'])}</b>\n"
-        f"❓ unknown (not in your team): <b>{len(rep['unknown'])}</b>"
+        f"❓ unknown: <b>{len(rep['unknown'])}</b>"
     ))
 
     return web.json_response({
@@ -236,6 +245,49 @@ async def handle_subs_ingest(req):
         "saved": saved,
         "confirmed": rep["confirmed"],
         "unknown": rep["unknown"],
+    })
+
+
+async def handle_check_uid(req):
+    """Check if a UID belongs to our team."""
+    if req.headers.get("X-Ingest-Token", "") != INGEST_TOKEN:
+        return web.json_response({"ok": False, "err": "unauthorized"}, status=401)
+    uid = (req.query.get("uid") or "").strip()
+    if not uid:
+        return web.json_response({"ok": False, "err": "no uid"}, status=400)
+
+    conn = sqlite3.connect(DB)
+    conn.row_factory = sqlite3.Row
+
+    sub = conn.execute(
+        "SELECT * FROM subordinates WHERE uid=?", (uid,)
+    ).fetchone()
+
+    cap = conn.execute(
+        "SELECT * FROM captures WHERE uid=? ORDER BY id DESC LIMIT 1", (uid,)
+    ).fetchone()
+
+    if not sub:
+        conn.close()
+        return web.json_response({
+            "ok": True,
+            "found": False,
+            "uid": uid,
+        })
+
+    sub_d = dict(sub)
+    cap_d = dict(cap) if cap else {}
+
+    conn.close()
+    return web.json_response({
+        "ok": True,
+        "found": True,
+        "uid": uid,
+        "userName": sub_d.get("user_name", "") or cap_d.get("user_name", ""),
+        "phone": sub_d.get("phone", "") or cap_d.get("phone", ""),
+        "balance": sub_d.get("balance", "") or cap_d.get("balance", ""),
+        "owner": sub_d.get("owner_uid", ""),
+        "joined": sub_d.get("captured_at", ""),
     })
 
 
@@ -252,11 +304,32 @@ async def handle_list(req):
     conn = sqlite3.connect(DB)
     conn.row_factory = sqlite3.Row
     limit = int(req.query.get("limit", 200))
-    rows = conn.execute("SELECT * FROM captures ORDER BY id DESC LIMIT ?",
-                        (limit,)).fetchall()
+    rows = conn.execute(
+        "SELECT * FROM captures ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
     conn.close()
-    return web.json_response({"ok": True, "count": len(rows),
-                              "items": [dict(r) for r in rows]})
+    return web.json_response({
+        "ok": True,
+        "count": len(rows),
+        "items": [dict(r) for r in rows],
+    })
+
+
+async def handle_subs_list(req):
+    if req.query.get("token", "") != INGEST_TOKEN:
+        return web.json_response({"ok": False, "err": "unauthorized"}, status=401)
+    conn = sqlite3.connect(DB)
+    conn.row_factory = sqlite3.Row
+    limit = int(req.query.get("limit", 200))
+    rows = conn.execute(
+        "SELECT * FROM subordinates ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    return web.json_response({
+        "ok": True,
+        "count": len(rows),
+        "items": [dict(r) for r in rows],
+    })
 
 
 def make_app():
@@ -265,8 +338,10 @@ def make_app():
     app.router.add_get("/health", handle_health)
     app.router.add_post("/api/public/captures-ingest", handle_ingest)
     app.router.add_post("/api/public/subordinates-ingest", handle_subs_ingest)
+    app.router.add_get("/api/public/check-uid", handle_check_uid)
     app.router.add_get("/api/public/report", handle_report)
     app.router.add_get("/api/public/captures-list", handle_list)
+    app.router.add_get("/api/public/subordinates-list", handle_subs_list)
     return app
 
 
