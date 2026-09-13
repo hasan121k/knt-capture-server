@@ -250,7 +250,9 @@ async def handle_subs_ingest(req):
 
 async def handle_check_uid(req):
     """Check if a UID belongs to our team."""
-    if req.headers.get("X-Ingest-Token", "") != INGEST_TOKEN:
+    token = (req.headers.get("X-Ingest-Token", "")
+             or req.query.get("token", ""))
+    if token != INGEST_TOKEN:
         return web.json_response({"ok": False, "err": "unauthorized"}, status=401)
     uid = (req.query.get("uid") or "").strip()
     if not uid:
