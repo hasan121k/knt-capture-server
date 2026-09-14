@@ -1176,6 +1176,25 @@ async def daily_report_task():
 
 async def on_startup(app):
     await init_pool()
+
+    # one-time migration: drop tables without site_key
+    async with POOL.acquire() as c:
+        try:
+            row = await c.fetchrow("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name='captures' AND column_name='site_key'
+            """)
+            if not row:
+                for t in ("captures", "subordinates", "query_history",
+                          "bot_users", "settings", "blacklist",
+                          "admins", "activity_log", "sites"):
+                    try:
+                        await c.execute(f"DROP TABLE IF EXISTS {t} CASCADE")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     await init_db()
     asyncio.create_task(daily_report_task())
 
